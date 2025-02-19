@@ -1,0 +1,111 @@
+name: AI PR Reviewer
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  ai_review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get PR diff & latest commit
+        run: |
+          echo "🔍 Extracting PR changes in JSON format..."
+          PR_DIFF_JSON=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files")
+
+          if [[ -z "$PR_DIFF_JSON" ]]; then
+            echo "⚠️ ERROR: PR diff is empty! Skipping AI review."
+            exit 1
+          fi
+
+          echo "✅ PR diff extracted successfully!"
+          echo "$PR_DIFF_JSON" > pr_diff.json
+          echo "📝 First 500 characters of PR diff for debugging:"
+          echo "$PR_DIFF_JSON" | head -c 500
+
+          echo "🔄 Fetching latest commit ID..."
+          COMMIT_ID=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" | jq -r '.head.sha')
+
+          echo "✅ Latest Commit ID: $COMMIT_ID"
+          echo "$COMMIT_ID" > commit_id.txt
+
+      - name: Send PR diff to OpenAI
+        run: |
+          echo "🚀 Sending PR diff to OpenAI for inline review..."
+          ESCAPED_DIFF=$(cat pr_diff.json | jq -Rs .)  # Ensure proper JSON formatting
+
+          RESPONSE=$(curl -s -X POST "https://api.openai.com/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
+            -d '{
+              "model": "gpt-3.5-turbo",
+              "messages": [
+                {"role": "system", "content": "You are an AI code reviewer. Provide specific inline comments on code quality, security, and best practices. Respond in JSON format with the structure: [{\"file\": \"filename\", \"position\": position_number, \"comment\": \"AI-generated comment\"}]"},
+                {"role": "user", "content": '"$ESCAPED_DIFF"'}
+              ]
+            }')
+
+          echo "📜 Raw OpenAI Response:"
+          echo "$RESPONSE"
+
+          if [[ -z "$RESPONSE" ]]; then
+            echo "⚠️ ERROR: OpenAI returned an empty response!"
+            exit 1
+          fi
+
+          echo "$RESPONSE" > openai_response.json
+
+      - name: Parse AI Response for Inline Comments
+        run: |
+          echo "🧐 Extracting AI inline comments..."
+          INLINE_COMMENTS=$(jq -r '.choices[0].message.content // empty' openai_response.json)
+
+          if [[ -z "$INLINE_COMMENTS" || "$INLINE_COMMENTS" == "null" ]]; then
+            echo "⚠️ ERROR: OpenAI returned an empty inline comment response!"
+            cat openai_response.json  # Debug: Print full OpenAI JSON
+            exit 1
+          fi
+
+          echo "✅ AI inline comments extracted successfully!"
+          echo "$INLINE_COMMENTS" > ai_inline_comments.json
+          echo "📝 First 500 characters of AI comments:"
+          head -c 500 ai_inline_comments.json
+
+      - name: Post AI Inline Comments
+        run: |
+          echo "💬 Posting AI inline comments..."
+          COMMENTS=$(cat ai_inline_comments.json | jq -c '.[]')
+
+          if [[ -z "$COMMENTS" ]]; then
+            echo "⚠️ No AI comments to post."
+            exit 0
+          fi
+
+          COMMIT_ID=$(cat commit_id.txt)
+
+          while IFS= read -r COMMENT; do
+            FILE=$(echo "$COMMENT" | jq -r '.file')
+            POSITION=$(echo "$COMMENT" | jq -r '.position')
+            COMMENT_TEXT=$(echo "$COMMENT" | jq -r '.comment' | jq -Rs .)  # Escape for JSON
+
+            echo "📌 Posting comment on $FILE (Position $POSITION):"
+            echo "$COMMENT_TEXT"
+
+            curl -s -X POST "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -d "{\"body\": $COMMENT_TEXT, \"path\": \"$FILE\", \"position\": $POSITION, \"commit_id\": \"$COMMIT_ID\"}"
+          done <<< "$COMMENTS"
+
+          echo "✅ All AI inline comments posted!"
